@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "matteodevenuto.clock",
   "name": "Calendar Clock",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "Matteo De Venuto",
   "description": "Date/time label with a calendar popup",
   "kinds": [

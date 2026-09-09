@@ -67,6 +67,29 @@ panel; Escape closes it.
 | `refreshIntervalSec` | integer | 900 | Calendar feed poll interval |
 | `feedsFile` | path | — | Defaults to `~/.config/omarchy/calendars/feeds.json` |
 
+## Omarchy Quattro
+
+On Quattro, third-party plugins talk to the bar through a facade. The
+`centerHoverRevealSuppressed` flag is **read-only**. Assigning it on panel
+open/close throws `TypeError` and freezes the shell until restart.
+
+Use the setter, like stock `omarchy.clock`:
+
+```qml
+function setCenterHoverRevealSuppressed(value) {
+  if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+    root.bar.setCenterHoverRevealSuppressed(value)
+  else if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+    root.bar.centerHoverRevealSuppressed = value
+}
+```
+
+Already applied in 1.0.3. Existing installs:
+
+```bash
+omarchy plugin update matteodevenuto.clock
+```
+
 ## Credits
 
 Built on the stock [Omarchy](https://omarchy.org/) clock plugin (MIT, by
