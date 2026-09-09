@@ -54,6 +54,31 @@ class FeedOperationTest(unittest.TestCase):
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_feed_storage_rejects_symlink_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real"
+            real.mkdir()
+            (root / "linked").symlink_to(real, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                CALENDARS_SYNC.save_feeds(root / "linked" / "feeds.json", [])
+
+            self.assertFalse((real / "feeds.json").exists())
+
+    def test_atomic_write_rejects_symlink_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            victim = root / "victim"
+            victim.write_text("keep")
+            target = root / "feeds.json"
+            target.symlink_to(victim)
+
+            with self.assertRaises(PermissionError):
+                CALENDARS_SYNC.write_atomic(target, "replace")
+
+            self.assertEqual(victim.read_text(), "keep")
+
 
 class NetworkSecurityTest(unittest.TestCase):
     def test_loopback_address_is_rejected(self):

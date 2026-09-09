@@ -7,8 +7,9 @@ import multiprocessing
 import os
 import re
 import resource
-import shutil
+import secrets
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -261,8 +262,8 @@ def migrate_legacy_feeds(override):
     if not os.path.exists(legacy):
         return
     try:
-        ensure_private_dir(CONFIG_DIR)
-        shutil.copy2(legacy, path)
+        with open(legacy, encoding="utf-8") as source:
+            write_atomic(path, source.read())
     except OSError:
         pass
 
@@ -302,7 +303,6 @@ def load_feeds(path):
 
 
 def save_feeds(path, feeds):
-    ensure_private_dir(os.path.dirname(path))
     payload = [
         {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
         for f in feeds
@@ -314,27 +314,101 @@ def ensure_private_dir(directory):
     # feeds.json and the cached .ics files hold share-link URLs, which are
     # bearer-style secrets -- keep the directory owner-only rather than
     # relying only on the files inside it being 0600.
-    os.makedirs(directory, exist_ok=True)
+    directory_fd = open_private_dir(directory, create=True)
+    os.close(directory_fd)
+
+def open_private_dir(directory, create=False):
+    """Open a user-owned directory without following any path symlinks.
+
+    Walking with directory FDs prevents path substitution between validation
+    and use.  Root-owned ancestors may be traversed, but the directory in
+    which secrets are read or written must belong to the effective user.
+    """
+    path = os.path.abspath(os.fspath(directory or "."))
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(os.path.sep, flags)
     try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
+        for component in (part for part in path.split(os.path.sep) if part):
+            try:
+                child_fd = os.open(component, flags | nofollow, dir_fd=directory_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+                child_fd = os.open(component, flags | nofollow, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+
+        info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError(f"refusing non-owned directory: {path}")
+        os.fchmod(directory_fd, 0o700)
+        # Revalidate the descriptor after changing permissions. All later
+        # operations use this same pinned descriptor, never the path again.
+        checked = os.fstat(directory_fd)
+        if checked.st_dev != info.st_dev or checked.st_ino != info.st_ino:
+            raise OSError("directory changed during validation")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+def _validate_owned_regular(directory_fd, name):
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise PermissionError(f"refusing non-owned or non-regular file: {name}")
+    return info
 
 
 def write_atomic(path, text):
     directory = os.path.dirname(path) or "."
-    ensure_private_dir(directory)
-    handle, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    name = os.path.basename(path)
+    directory_fd = open_private_dir(directory, create=True)
+    directory_info = os.fstat(directory_fd)
+    temp = ".tmp-" + secrets.token_hex(16)
+    handle = -1
+    temp_info = None
     try:
+        _validate_owned_regular(directory_fd, name)
+        handle = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
         with os.fdopen(handle, "w", encoding="utf-8") as out:
+            handle = -1
             out.write(text)
-        os.replace(temp, path)
+            out.flush()
+            os.fsync(out.fileno())
+            temp_info = os.fstat(out.fileno())
+        _validate_owned_regular(directory_fd, name)
+        current_directory = os.fstat(directory_fd)
+        if (current_directory.st_dev, current_directory.st_ino) != (
+            directory_info.st_dev, directory_info.st_ino
+        ):
+            raise OSError("directory changed before atomic replace")
+        os.rename(temp, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        written = _validate_owned_regular(directory_fd, name)
+        if written is None or (written.st_dev, written.st_ino) != (
+            temp_info.st_dev, temp_info.st_ino
+        ):
+            raise OSError("atomic write target failed revalidation")
+        os.fsync(directory_fd)
     except BaseException:
         try:
-            os.unlink(temp)
+            os.unlink(temp, dir_fd=directory_fd)
         except OSError:
             pass
         raise
+    finally:
+        if handle >= 0:
+            os.close(handle)
+        os.close(directory_fd)
 
 
 def cache_file(url):
