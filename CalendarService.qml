@@ -53,9 +53,18 @@ Item {
   }
 
   function syncArgs(extra) {
-    var args = ["python3", scriptPath("calendars-sync")]
+    // -I: ignore PYTHON* env vars and the user site dir, so imports stay in system paths
+    var args = ["/usr/bin/python3", "-I", scriptPath("calendars-sync")]
     if (feedsFile !== "") args = args.concat(["--feeds", feedsFile])
     return extra ? args.concat(extra) : args
+  }
+
+  // Backend runs with a cleared environment; pass only what it needs.
+  readonly property var syncEnv: {
+    var env = { "HOME": Quickshell.env("HOME"), "LC_ALL": "C.UTF-8" }
+    var tz = Quickshell.env("TZ")
+    if (tz) env["TZ"] = tz
+    return env
   }
 
   function apply(text) {
@@ -119,6 +128,8 @@ Item {
   Process {
     id: syncProcess
     command: []
+    clearEnvironment: true
+    environment: root.syncEnv
     stdout: StdioCollector { id: syncStdout; waitForEnd: true }
     onExited: function (exitCode) {
       if (exitCode === 0) root.apply(String(syncStdout.text || ""))
@@ -129,6 +140,8 @@ Item {
   Process {
     id: cacheProcess
     command: []
+    clearEnvironment: true
+    environment: root.syncEnv
     stdout: StdioCollector { id: cacheStdout; waitForEnd: true }
     onExited: function (exitCode) {
       if (exitCode === 0) root.apply(String(cacheStdout.text || ""))
@@ -140,6 +153,8 @@ Item {
     id: feedProcess
     property string input: ""
     command: []
+    clearEnvironment: true
+    environment: root.syncEnv
     stdinEnabled: true
     stdout: StdioCollector { id: feedStdout; waitForEnd: true }
     onStarted: write(input)

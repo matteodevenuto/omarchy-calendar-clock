@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 import argparse
 import hashlib
 import ipaddress
@@ -486,13 +486,15 @@ def fetch_one_hop(url):
     os.close(handle)
     try:
         result = subprocess.run(
-            ["curl", "-s", "-K", "-", "--proto", "=http,https",
+            # Absolute path, -q skips ~/.curlrc, minimal env drops proxy/ambient vars.
+            ["/usr/bin/curl", "-q", "-s", "-K", "-", "--proto", "=http,https",
              "--resolve", f"{hostname}:{port}:{ip}",
              "--max-time", str(FETCH_TIMEOUT),
              "--max-filesize", str(MAX_FEED_BYTES),
              "-D", header_path],
             input=curl_config(url).encode("utf-8"),
             capture_output=True, timeout=FETCH_TIMEOUT + 10,
+            env={"PATH": "/usr/bin", "LC_ALL": "C"},
         )
         with open(header_path, encoding="utf-8", errors="replace") as handle:
             headers = handle.read()
