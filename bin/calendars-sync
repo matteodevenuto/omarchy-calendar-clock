@@ -37,6 +37,10 @@ EXPANSION_MEMORY_LIMIT_BYTES = 300 * 1024 * 1024
 MAX_EVENTS_PER_FEED = 3000
 MAX_EVENTS_TOTAL = 10000
 MAX_FEEDS = 50
+MAX_FEEDS_FILE_BYTES = 1024 * 1024
+MAX_HEADER_BYTES = 1024 * 1024
+MAX_RESULT_BYTES = 16 * 1024 * 1024
+MAX_TEXT_CHARS = 4000
 
 
 class ExpansionAborted(Exception):
@@ -262,8 +266,7 @@ def migrate_legacy_feeds(override):
     if not os.path.exists(legacy):
         return
     try:
-        with open(legacy, encoding="utf-8") as source:
-            write_atomic(path, source.read())
+        write_atomic(path, read_private(legacy, MAX_FEEDS_FILE_BYTES))
     except OSError:
         pass
 
@@ -272,12 +275,7 @@ def load_feeds(path):
     if not os.path.exists(path):
         return [], ""
     try:
-        os.chmod(os.path.dirname(path) or ".", 0o700)
-    except OSError:
-        pass
-    try:
-        with open(path, encoding="utf-8") as handle:
-            raw = json.load(handle)
+        raw = json.loads(read_private(path, MAX_FEEDS_FILE_BYTES))
     except (OSError, ValueError) as exc:
         return [], f"{path}: {exc}"
 
@@ -362,6 +360,34 @@ def _validate_owned_regular(directory_fd, name):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
         raise PermissionError(f"refusing non-owned or non-regular file: {name}")
     return info
+
+
+def read_private(path, limit):
+    """Read a user-owned regular file, bounded, without following symlinks.
+
+    O_NONBLOCK keeps a planted FIFO from stalling open(); the fstat check then
+    rejects anything that is not a regular file, and the size cap bounds both
+    this process's memory and what the panel collects from stdout.
+    """
+    directory_fd = open_private_dir(os.path.dirname(path) or ".")
+    try:
+        handle = os.open(
+            os.path.basename(path),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+    with os.fdopen(handle, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError(f"refusing non-owned or non-regular file: {path}")
+        if info.st_size > limit:
+            raise OSError(f"file too large: {path}")
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f"file too large: {path}")
+    return data.decode("utf-8", "replace")
 
 
 def write_atomic(path, text):
@@ -483,7 +509,6 @@ def fetch_one_hop(url):
         return None, None, dns_error
 
     handle, header_path = tempfile.mkstemp(prefix=".hdr-")
-    os.close(handle)
     try:
         result = subprocess.run(
             # Absolute path, -q skips ~/.curlrc, minimal env drops proxy/ambient vars.
@@ -496,11 +521,16 @@ def fetch_one_hop(url):
             capture_output=True, timeout=FETCH_TIMEOUT + 10,
             env={"PATH": "/usr/bin", "LC_ALL": "C"},
         )
-        with open(header_path, encoding="utf-8", errors="replace") as handle:
-            headers = handle.read()
+        # Read back through the descriptor mkstemp created, bounded, rather
+        # than reopening the path.
+        with os.fdopen(handle, "rb") as source:
+            handle = -1
+            headers = source.read(MAX_HEADER_BYTES).decode("utf-8", "replace")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, None, f"fetch failed: {exc}"
     finally:
+        if handle >= 0:
+            os.close(handle)
         try:
             os.unlink(header_path)
         except OSError:
@@ -553,8 +583,7 @@ def fetch(url):
 
 def read_cache(path, error):
     try:
-        with open(path, encoding="utf-8") as handle:
-            return handle.read(), error, True
+        return read_private(path, MAX_FEED_BYTES), error, True
     except OSError:
         return "", error, False
 
@@ -612,7 +641,7 @@ def text_of(component, key):
     value = component.get(key)
     if value is None:
         return ""
-    return plain_text(str(value).strip())
+    return plain_text(str(value).strip())[:MAX_TEXT_CHARS]
 
 
 def expand(text, feed, window_start, window_end, tz):
@@ -711,6 +740,17 @@ def result_path():
     return os.path.join(CACHE_DIR, "events.json")
 
 
+def encode_result(payload):
+    # Keep the output under the size --cached will read back and the panel
+    # collects from stdout; drop the latest events rather than fail.
+    text = json.dumps(payload, ensure_ascii=False)
+    while len(text.encode("utf-8")) > MAX_RESULT_BYTES and payload.get("events"):
+        payload["events"] = payload["events"][:len(payload["events"]) // 2]
+        payload["error"] = payload.get("error") or "too many events; list truncated"
+        text = json.dumps(payload, ensure_ascii=False)
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch shared iCalendar feeds and emit a flat event list as JSON.")
     parser.add_argument("--feeds", default="", help="feeds file (default ~/.config/omarchy/calendars/feeds.json)")
@@ -734,7 +774,7 @@ def main():
     operation = {}
     if args.feed_operation_stdin:
         try:
-            operation = json.loads(sys.stdin.readline())
+            operation = json.loads(sys.stdin.readline(MAX_FEEDS_FILE_BYTES))
         except (json.JSONDecodeError, TypeError):
             parser.error("stdin must contain one JSON feed operation")
         if not isinstance(operation, dict):
@@ -787,9 +827,8 @@ def main():
 
     if args.cached:
         try:
-            with open(result_path(), encoding="utf-8") as handle:
-                sys.stdout.write(handle.read())
-                return 0
+            sys.stdout.write(read_private(result_path(), MAX_RESULT_BYTES))
+            return 0
         except OSError:
             pass
 
@@ -811,7 +850,7 @@ def main():
             "error": plain_text(f"sync failed: {exc}"),
         }
 
-    text = json.dumps(payload, ensure_ascii=False)
+    text = encode_result(payload)
     try:
         write_atomic(result_path(), text)
     except OSError:

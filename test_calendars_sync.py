@@ -2,6 +2,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -78,6 +79,58 @@ class FeedOperationTest(unittest.TestCase):
                 CALENDARS_SYNC.write_atomic(target, "replace")
 
             self.assertEqual(victim.read_text(), "keep")
+
+
+class BoundedReadTest(unittest.TestCase):
+    def test_read_cache_rejects_fifo_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "planted.ics"
+            os.mkfifo(fifo)
+            self.assertEqual(CALENDARS_SYNC.read_cache(str(fifo), "offline"), ("", "offline", False))
+
+    def test_read_cache_rejects_oversized_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            big = Path(directory) / "big.ics"
+            big.write_bytes(b"x" * 11)
+            with patch.object(CALENDARS_SYNC, "MAX_FEED_BYTES", 10):
+                self.assertEqual(CALENDARS_SYNC.read_cache(str(big), "offline"), ("", "offline", False))
+
+    def test_read_cache_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "secret").write_text("BEGIN:VCALENDAR")
+            (root / "cache.ics").symlink_to(root / "secret")
+            self.assertEqual(CALENDARS_SYNC.read_cache(str(root / "cache.ics"), "offline"), ("", "offline", False))
+
+    def test_cached_output_ignores_fifo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "events.json"
+            os.mkfifo(fifo)
+            payload = {"ok": True, "configured": False, "feeds": [], "events": []}
+            out = io.StringIO()
+            with (
+                patch.object(sys, "argv", [str(SCRIPT), "--feeds", str(Path(directory) / "feeds.json"), "--cached"]),
+                patch.object(sys, "stdout", out),
+                patch.object(CALENDARS_SYNC, "sync", return_value=payload),
+                patch.object(CALENDARS_SYNC, "result_path", return_value=str(fifo)),
+            ):
+                self.assertEqual(CALENDARS_SYNC.main(), 0)
+            self.assertEqual(json.loads(out.getvalue()), payload)
+
+    def test_load_feeds_rejects_fifo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "feeds.json"
+            os.mkfifo(fifo)
+            feeds, error = CALENDARS_SYNC.load_feeds(str(fifo))
+            self.assertEqual(feeds, [])
+            self.assertIn("non-regular", error)
+
+    def test_result_is_truncated_to_size_cap(self):
+        events = [{"title": "x" * 100} for _ in range(100)]
+        with patch.object(CALENDARS_SYNC, "MAX_RESULT_BYTES", 2000):
+            text = CALENDARS_SYNC.encode_result({"error": "", "events": events})
+        self.assertLessEqual(len(text.encode()), 2000)
+        self.assertTrue(json.loads(text)["events"])
 
 
 class NetworkSecurityTest(unittest.TestCase):
